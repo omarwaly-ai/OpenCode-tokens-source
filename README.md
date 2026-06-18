@@ -7,11 +7,11 @@
 
 **Per-source token usage breakdown for [opencode](https://opencode.ai)**
 
-See exactly what's consuming your context window — broken down by source.
+See what's consuming your context window — broken down by source.
 
-[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 [![opencode](https://img.shields.io/badge/opencode-plugin-blue)](https://opencode.ai)
 [![TypeScript](https://img.shields.io/badge/TypeScript-5-blue)](https://www.typescriptlang.org/)
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 
 </div>
 
