@@ -1,6 +1,9 @@
+<p align="center">
+ <img width="150" height="150" alt="OpenCode Tokens Source Plugin" src="https://github.com/user-attachments/assets/fb3bba12-7d2b-4f83-9ea2-8b58f327255f" />
+</p>
 <div align="center">
 
-# opencode-tokens-source
+# Opencode Tokens Source Plugin
 
 **Per-source token usage breakdown for [opencode](https://opencode.ai)**
 
