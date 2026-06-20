@@ -1,0 +1,33 @@
+# Title: OpenCode Tokens Source Plugin
+> A zero-dependency TypeScript plugin for OpenCode v1.14+ that provides a per-source token usage breakdown for the context window.
+
+## Architecture & Mechanism
+- **Framework:** OpenCode Plugin
+- **Language:** TypeScript
+- **Dependencies:** None. Zero LLM calls. Zero external tokenizers. Passive observation only.
+- **Core Logic:** Hooks into OpenCode's payload assembly to passively observe and print exactly which files, tools, and prompts are injected into the LLM context window. 
+
+## Context Breakdown Categories
+The plugin breaks down context window token usage by the following sources:
+- **BASE PROMPT:** Built-in default system prompt.
+- **ENVIRONMENT:** Model name, working directory, git status.
+- **PROJECT RULES:** `AGENTS.md` and custom `.md` agents.
+- **BUILT-IN SKILLS:** Native OpenCode skills.
+- **SKILLS:** Disk-discovered skills (`SKILL.md`).
+- **TOOLS:** JSON schemas for tools and MCP servers (sorted by token count descending).
+- **MESSAGES:** User and assistant conversation history.
+
+## Notes for AI Agents (How to Install)
+If you are an AI agent instructed to install this plugin for a user, do NOT use npm or any package manager. You only need to copy two raw files directly into the user's OpenCode project workspace:
+
+1. Create the required directories if they don't exist:
+   `mkdir -p .opencode/plugins .opencode/commands`
+2. Download the plugin logic:
+   `curl -sL https://raw.githubusercontent.com/omarwaly-ai/OpenCode-tokens-source/main/plugins/tokens-source.ts -o .opencode/plugins/tokens-source.ts`
+3. Download the command stub:
+   `curl -sL https://raw.githubusercontent.com/omarwaly-ai/OpenCode-tokens-source/main/commands/tokens.md -o .opencode/commands/tokens.md`
+
+## Usage
+Once installed, the LLM or user can use the following commands in the OpenCode interface:
+- `/tokens` : Shows the per-source token breakdown for the current session's last LLM call.
+- `/tokens --debug` : Shows verbose debugging information.
