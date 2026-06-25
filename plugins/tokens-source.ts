@@ -1,548 +1,796 @@
-// .opencode/plugins/tokens-source.ts
-// Per-source token usage breakdown for opencode CLI.
-//
-// DESIGN PRINCIPLES (learned from the previous mess):
-//   1. ONE source of truth per data point — no duplicate captures
-//   2. ONE estimation function — used everywhere, no alternative paths
-//   3. Debug log shows the SAME numbers the output uses — no conflicting calculations
-//   4. NO fallback paths that produce different numbers
-//   5. NO markdown, NO ANSI — plain text with Unicode bold only
-//
-// DATA FLOW (single direction, no loops):
-//   config hook           → knownAgents (agent name + prompt + path)
-//   system.transform hook → systemParts (system string array)
-//   fetch wrapper         → payload (final HTTP body: systemText + messages + tools)
-//   tool.execute hooks    → fileReads + toolOutputs (per-file / per-tool output tracking)
-//   /tokens command       → reads ALL of the above, builds output ONCE
-//
-// Output: plain text. Bold via Unicode Mathematical Alphanumeric Symbols.
-// Debug: /tokens --debug appends raw diagnostic data.
+// .opencode/plugin/tokens-source.ts
+// Token usage breakdown by source for opencode CLI
+// Hooks: experimental.chat.system.transform + experimental.chat.messages.transform
+//        + tool.definition + command.execute.before
 
 import type { Plugin, PluginInput, Hooks } from "@opencode-ai/plugin"
+import { Schema as EffectSchema } from "effect"
 
-// Bun is a global at runtime in opencode. Ambient type for VS Code.
-declare const Bun: {
-  writeFileSync(path: string, data: string): void
-  file(path: string): { exists(): Promise<boolean> }
+// ─── Types ───────────────────────────────────────────────────────────────────
+
+interface SourceBreakdown {
+  label: string
+  chars: number
+  tokens: number
 }
 
-// ─── Token estimation ────────────────────────────────────────
-// Single estimation function used everywhere. No alternatives.
-const TOKEN_RATIO = 3.75
-function estimateTokens(text: string): number {
-  if (!text) return 0
-  return Math.ceil(text.length / TOKEN_RATIO)
+interface ToolBreakdown {
+  id: string
+  tokens: number
 }
 
-// ─── Unicode bold ────────────────────────────────────────────
-// Converts text to Unicode Mathematical Alphanumeric Symbols (bold).
-// A-Z → 𝐀-𝐙, a-z → 𝐚-𝐳, 0-9 → 𝟎-𝟗. Other chars preserved.
-function bold(text: string): string {
-  let out = ""
-  for (const ch of text) {
-    const c = ch.codePointAt(0)!
-    if (c >= 65 && c <= 90) out += String.fromCodePoint(0x1D400 + (c - 65))
-    else if (c >= 97 && c <= 122) out += String.fromCodePoint(0x1D41A + (c - 97))
-    else if (c >= 48 && c <= 57) out += String.fromCodePoint(0x1D7CE + (c - 48))
-    else out += ch
-  }
-  return out
+interface MsgBreakdown {
+  role: string
+  parts: { type: string; chars: number; tokens: number }[]
+  totalChars: number
+  totalTokens: number
 }
 
-// ─── Path cleaning ───────────────────────────────────────────
-// Strips user-home prefixes. Returns path from opencode anchor.
-function cleanPath(rawPath: string): string {
-  if (!rawPath) return ""
-  let p = rawPath
-  try { p = decodeURIComponent(new URL(p).pathname) } catch {}
-  p = p.replace(/\\/g, "/")
-  const anchors = ["/.config/opencode/", "/.opencode/", "/.claude/", "/.agents/"]
-  for (const a of anchors) {
-    const idx = p.lastIndexOf(a)
-    if (idx >= 0) return p.slice(idx + 1)
-  }
-  const segs = p.split("/").filter(Boolean)
-  if (segs.length >= 2) return segs[segs.length - 2] + "/" + segs[segs.length - 1]
-  if (segs.length === 1) return segs[0]
-  return p
+interface TokenSnapshot {
+  sources: SourceBreakdown[]
+  totalSystemChars: number
+  totalSystemTokens: number
+  timestamp: number
 }
 
-// Built-in skill detection: opencode reports location as "<built-in>" or URL containing it.
-function isBuiltinLocation(loc: string): boolean {
-  if (!loc || loc === "<built-in>") return true
+interface MsgSnapshot {
+  messages: MsgBreakdown[]
+  totalChars: number
+  totalTokens: number
+  timestamp: number
+}
+
+// ─── State ───────────────────────────────────────────────────────────────────
+
+const globalTools: ToolBreakdown[] = []
+const snapshots = new Map<string, TokenSnapshot>()
+const msgSnapshots = new Map<string, MsgSnapshot>()
+
+// ─── Token estimation ─────────────────────────────────────────────────────────
+
+function est(charCount: number): number {
+  return Math.ceil(charCount / 4)
+}
+
+// ─── Convert Effect Schema to JSON Schema ────────────────────────────────────
+//
+// The `tool.definition` hook provides `output.parameters` as an Effect Schema
+// AST object (with `~effect/Schema` symbols). Stringifying it directly gives
+// ~6x inflated sizes because it includes AST metadata, annotations, etc.
+//
+// We use Effect's `Schema.toJsonSchemaDocument()` to convert it to the real
+// JSON Schema that the LLM API actually receives. This is the correct API
+// in Effect 4.0.0-beta.83 (bundled with opencode 1.17.10).
+//
+// Note: `Schema.toStandardJSONSchemaV1()` exists but returns an EMPTY jsonSchema
+// object in this version — it only adds a `~standard` wrapper without computing
+// the actual schema. `toJsonSchemaDocument()` is the working API.
+
+function effectToJSONSchema(effectSchema: any): any | null {
+  if (!effectSchema) return null
+
+  // Preferred: toJsonSchemaDocument (works in Effect 4.0.0-beta.83)
   try {
-    const p = decodeURIComponent(new URL(loc).pathname)
-    if (p.includes("<built-in>")) return true
-  } catch {}
-  return loc.includes("<built-in>")
-}
-
-// ─── Types ───────────────────────────────────────────────────
-interface SourceItem {
-  label: string       // display label (path or name)
-  tokens: number      // estimated tokens
-  chars: number       // raw char count
-  category: "base" | "env" | "rules" | "builtin-skill" | "skill" | "tools" | "messages" | "other"
-}
-
-interface InterceptedPayload {
-  url: string
-  model: string
-  sessionID: string
-  systemText: string
-  messages: { role: string; text: string }[]
-  tools: { name: string; rawJson: string }[]
-  rawBodyLength: number
-}
-
-// ─── State (single source per data type) ─────────────────────
-const systemPartsBySession = new Map<string, string[]>()
-const payloadBySession = new Map<string, InterceptedPayload>()
-const knownAgents = new Map<string, { name: string; prompt: string; path: string }>()
-const fileReads = new Map<string, { chars: number; tokens: number; reads: number; isInstruction: boolean }>()
-const toolOutputs = new Map<string, { chars: number; tokens: number; count: number }>()
-const pendingCalls = new Map<string, { tool: string; file?: string; args?: Record<string, any> }>()
-
-// ─── Instruction file detection ──────────────────────────────
-const INSTRUCTION_FILES = ["AGENTS.md", "CLAUDE.md", "agents.md", "claude.md", ".agents.md", ".claude.md", "instructions.md"]
-function isInstructionFile(filePath: string): boolean {
-  const n = filePath.replace(/\\/g, "/")
-  return INSTRUCTION_FILES.some(name => n.endsWith("/" + name) || n === name)
-}
-
-// ─── MCP tool detection ──────────────────────────────────────
-function isMCPTool(name: string): boolean {
-  return name.startsWith("mcp_") || name.startsWith("mcp__") || name.includes("__")
-}
-
-// ─── System text parser ──────────────────────────────────────
-// Parses the joined system string into sections by markers.
-// Returns SourceItems with NON-overlapping slices.
-type ParsedSection = { label: string; start: number; end: number; path?: string; category: SourceItem["category"] }
-
-function parseSystem(systemText: string): SourceItem[] {
-  const s = systemText
-  if (!s.trim()) return []
-  const secs: ParsedSection[] = []
-
-  // Environment: model marker
-  const envModelIdx = s.indexOf("You are powered by the model named")
-  const envTagIdx = s.indexOf("<env>")
-  if (envModelIdx >= 0) {
-    secs.push({ label: "model", start: envModelIdx, end: envTagIdx >= 0 ? envTagIdx : s.length, category: "env" })
-  }
-  if (envTagIdx >= 0) {
-    const close = s.indexOf("</env>", envTagIdx)
-    secs.push({ label: "cwd/git/platform", start: envTagIdx, end: close >= 0 ? close + 6 : s.length, category: "env" })
-  }
-
-  // Project rules: "Instructions from:" blocks
-  const instrRe = /Instructions from:\s*([^\n]+)/g
-  let m: RegExpExecArray | null
-  const instrPositions: { path: string; start: number }[] = []
-  while ((m = instrRe.exec(s)) !== null) {
-    instrPositions.push({ path: m[1].trim(), start: m.index })
-  }
-  for (let i = 0; i < instrPositions.length; i++) {
-    const next = i + 1 < instrPositions.length ? instrPositions[i + 1].start : nextMarker(s, instrPositions[i].start)
-    secs.push({
-      label: cleanPath(instrPositions[i].path),
-      path: cleanPath(instrPositions[i].path),
-      start: instrPositions[i].start,
-      end: next,
-      category: "rules",
-    })
-  }
-
-  // Skills: <available_skills> block
-  const skillsIdx = s.indexOf("Skills provide specialized instructions")
-  if (skillsIdx >= 0) {
-    const close = s.indexOf("</available_skills>", skillsIdx)
-    const blockEnd = close >= 0 ? close + 19 : s.length
-    const skillRe = /<skill>/g
-    const skillEntries: { name: string; loc: string; start: number }[] = []
-    let sm: RegExpExecArray | null
-    while ((sm = skillRe.exec(s)) !== null) {
-      if (sm.index < skillsIdx || sm.index >= blockEnd) continue
-      const sc = s.indexOf("</skill>", sm.index)
-      if (sc < 0) continue
-      const block = s.slice(sm.index, sc + 8)
-      const nm = block.match(/<name>([^<]+)<\/name>/)
-      const lm = block.match(/<location>([^<]+)<\/location>/)
-      skillEntries.push({
-        name: nm ? nm[1].trim() : "unknown",
-        loc: lm ? lm[1].trim() : "",
-        start: sm.index,
-      })
+    const doc = EffectSchema.toJsonSchemaDocument(effectSchema)
+    if (doc && (doc as any).schema) {
+      return (doc as any).schema
     }
-    if (skillEntries.length > 0) {
-      // Preamble (Skills header)
-      const preambleEnd = skillEntries[0].start
-      const preamble = s.slice(skillsIdx, preambleEnd).trim()
-      if (preamble) {
-        secs.push({ label: "Skills (header)", start: skillsIdx, end: preambleEnd, category: "skill" })
-      }
-      // Each skill
-      for (let i = 0; i < skillEntries.length; i++) {
-        const sc = s.indexOf("</skill>", skillEntries[i].start)
-        const end = sc >= 0 ? sc + 8 : (i + 1 < skillEntries.length ? skillEntries[i + 1].start : blockEnd)
-        const isBuiltin = isBuiltinLocation(skillEntries[i].loc)
-        secs.push({
-          label: isBuiltin ? skillEntries[i].name : cleanPath(skillEntries[i].loc),
-          path: isBuiltin ? skillEntries[i].name : cleanPath(skillEntries[i].loc),
-          start: skillEntries[i].start,
-          end: end,
-          category: isBuiltin ? "builtin-skill" : "skill",
-        })
-      }
-      // Closing
-      const lastEnd = secs[secs.length - 1].end
-      if (lastEnd < blockEnd) {
-        const closing = s.slice(lastEnd, blockEnd).trim()
-        if (closing) secs.push({ label: "Skills (closing)", start: lastEnd, end: blockEnd, category: "skill" })
-      }
-    } else {
-      secs.push({ label: "Skills", start: skillsIdx, end: blockEnd, category: "skill" })
+    if (doc && typeof doc === "object") return doc
+  } catch {
+    // Fall through
+  }
+
+  // Fallback: toStandardJSONSchemaV1 (older Effect versions)
+  try {
+    const result = EffectSchema.toStandardJSONSchemaV1(effectSchema)
+    const standard = result?.["~standard"]
+    if (standard?.jsonSchema && Object.keys(standard.jsonSchema).length > 0) {
+      return standard.jsonSchema
     }
+  } catch {
+    // Fall through
   }
 
-  // Sort and fix overlaps
-  secs.sort((a, b) => a.start - b.start)
-  for (let i = 1; i < secs.length; i++) {
-    if (secs[i].start < secs[i - 1].end) secs[i - 1].end = secs[i].start
+  // Final fallback: manual conversion
+  try {
+    return manualConvert(effectSchema)
+  } catch {
+    return null
   }
+}
 
-  // Build result: base prompt (text before first section) + all sections
-  const result: SourceItem[] = []
-  if (secs.length > 0 && secs[0].start > 0) {
-    const base = s.slice(0, secs[0].start).trim()
-    if (base) result.push({ label: "Base prompt", tokens: estimateTokens(base), chars: base.length, category: "base" })
-  } else if (secs.length === 0) {
-    const trimmed = s.trim()
-    if (trimmed) result.push({ label: "Base prompt", tokens: estimateTokens(trimmed), chars: trimmed.length, category: "base" })
+function manualConvert(node: any): any {
+  if (!node || typeof node !== "object") return {}
+  // Effect Schema struct: {"fields": {...}}
+  if (node.fields) {
+    const props: Record<string, any> = {}
+    const required: string[] = []
+    for (const [key, val] of Object.entries(node.fields)) {
+      const converted = manualConvert(val)
+      props[key] = converted
+      // Check if optional (has "schema" wrapper with "_tag" Optional)
+      const isOptional = (val as any)?.schema?._tag === "Optional" ||
+                         JSON.stringify(val).includes('"_tag":"Optional"')
+      if (!isOptional) required.push(key)
+    }
+    const result: any = { type: "object", properties: props }
+    if (required.length > 0) result.required = required
     return result
   }
-  for (const sec of secs) {
-    const content = s.slice(sec.start, sec.end).trim()
-    if (content) result.push({ label: sec.label, tokens: estimateTokens(content), chars: content.length, category: sec.category })
+  // Direct AST node: {"ast": {"_tag": "String", "annotations": {...}}}
+  if (node.ast) {
+    return manualConvert(node.ast)
   }
+  // Type node: {"_tag": "String", "annotations": {"description": "..."}}
+  if (node._tag) {
+    const typeMap: Record<string, string> = {
+      String: "string", Number: "number", Boolean: "boolean",
+      Int: "integer", BigInt: "number",
+    }
+    const result: any = {}
+    if (typeMap[node._tag]) result.type = typeMap[node._tag]
+    if (node.annotations?.description) result.description = node.annotations.description
+    return result
+  }
+  // Optional wrapper: {"schema": {"value": {...}}}
+  if (node.schema?.value) {
+    return manualConvert(node.schema.value)
+  }
+  return {}
+}
+
+// ─── Shorten a file path ──────────────────────────────────────────────────────
+// Show last 2 meaningful path segments so you can tell files apart.
+
+function shortPath(raw: string): string {
+  const normalized = raw.replace(/\\/g, "/")
+
+  if (normalized.startsWith(".") || normalized.startsWith("~")) return normalized
+
+  const anchors = [".opencode", ".claude", ".agents", ".config"]
+  for (const anchor of anchors) {
+    const idx = normalized.lastIndexOf("/" + anchor + "/")
+    if (idx >= 0) {
+      const fromAnchor = normalized.slice(idx + 1)
+      const segs = fromAnchor.split("/")
+      return segs.length > 3 ? segs.slice(0, 3).join("/") + "/..." : fromAnchor
+    }
+  }
+
+  const segs = normalized.split("/").filter(Boolean)
+  if (segs.length >= 2) return segs[segs.length - 2] + "/" + segs[segs.length - 1]
+  if (segs.length === 1) return segs[0]
+  return raw
+}
+
+// ─── Skill label from <location> tag ──────────────────────────────────────────
+
+function skillLabel(name: string, location: string): string {
+  if (!location || location === "<built-in>") return name
+
+  let filePath: string
+  try {
+    filePath = decodeURIComponent(new URL(location).pathname)
+  } catch {
+    filePath = location
+  }
+
+  filePath = filePath.replace(/\\/g, "/")
+
+  const anchors = [
+    "/.config/opencode/skills/",
+    "/.opencode/skills/",
+    "/.claude/skills/",
+    "/.agents/skills/",
+  ]
+
+  for (const pattern of anchors) {
+    const idx = filePath.lastIndexOf(pattern)
+    if (idx >= 0) {
+      const after = filePath.slice(idx + pattern.length)
+      const match = after.match(/^([^/]+)/)
+      const skillDir = match ? match[1] : name
+      return pattern.slice(1) + skillDir
+    }
+  }
+
+  return name
+}
+
+// ─── Parse system array into per-source breakdowns ───────────────────────────
+
+function parseSystemArray(parts: string[]): SourceBreakdown[] {
+  if (!parts.length) return []
+  const result: SourceBreakdown[] = []
+
+  const core = parts[0] || ""
+  if (core.trim()) {
+    result.push(...parseCoreBlob(core))
+  }
+
+  for (let i = 1; i < parts.length; i++) {
+    const txt = parts[i].trim()
+    if (!txt) continue
+    const firstLine = txt.split("\n")[0].slice(0, 60)
+    result.push({ label: `plugin[${i}]: ${firstLine}`, chars: txt.length, tokens: est(txt.length) })
+  }
+
   return result
 }
 
-function nextMarker(s: string, after: number): number {
-  const markers = ["Skills provide specialized instructions", "IMPORTANT: The user has requested structured output"]
+function parseCoreBlob(s: string): SourceBreakdown[] {
+  const trimmed = s.trim()
+  if (!trimmed) return []
+
+  type Sec = { label: string; start: number; end: number }
+  const secs: Sec[] = []
+
+  const envModelIdx = s.indexOf("You are powered by the model named")
+  const envTagIdx   = s.indexOf("<env>")
+  if (envModelIdx >= 0) {
+    secs.push({
+      label: "Environment (model)",
+      start: envModelIdx,
+      end: envTagIdx >= 0 ? envTagIdx : s.length,
+    })
+  }
+
+  if (envTagIdx >= 0) {
+    const envCloseIdx = s.indexOf("</env>", envTagIdx)
+    secs.push({
+      label: "Environment (cwd/git/platform)",
+      start: envTagIdx,
+      end: envCloseIdx >= 0 ? envCloseIdx + 6 : s.length,
+    })
+  }
+
+  const refOpenIdx = s.indexOf("<available_references>")
+  if (refOpenIdx >= 0) {
+    const refCloseIdx = s.indexOf("</available_references>", refOpenIdx)
+    const preambleIdx = s.lastIndexOf("Project references", refOpenIdx)
+    secs.push({
+      label: "Environment (references)",
+      start: preambleIdx >= 0 ? preambleIdx : refOpenIdx,
+      end: refCloseIdx >= 0 ? refCloseIdx + 23 : s.length,
+    })
+  }
+
+  const instrRe = /Instructions from:\s*([^\n]+)/g
+  let instrMatch: RegExpExecArray | null
+  const instrPositions: { path: string; start: number }[] = []
+  while ((instrMatch = instrRe.exec(s)) !== null) {
+    instrPositions.push({
+      path: instrMatch[1].trim(),
+      start: instrMatch.index,
+    })
+  }
+  for (let i = 0; i < instrPositions.length; i++) {
+    const nextStart =
+      i + 1 < instrPositions.length
+        ? instrPositions[i + 1].start
+        : nextMajorMarkerAfter(s, instrPositions[i].start)
+    secs.push({
+      label: shortPath(instrPositions[i].path),
+      start: instrPositions[i].start,
+      end: nextStart,
+    })
+  }
+
+  const skillsIdx = s.indexOf("Skills provide specialized instructions")
+  if (skillsIdx >= 0) {
+    const skillsCloseIdx    = s.indexOf("</available_skills>", skillsIdx)
+    const structAfterSkills = s.indexOf("IMPORTANT: The user has requested structured output", skillsIdx)
+    const skillsBlockEnd    = skillsCloseIdx >= 0 ? skillsCloseIdx + 19 : s.length
+    const skillsBlockRealEnd = structAfterSkills >= 0 && structAfterSkills < skillsBlockEnd ? structAfterSkills : skillsBlockEnd
+
+    const skillOpenRe = /<skill>/g
+    const skillEntries: { label: string; start: number }[] = []
+    let skillOpenMatch: RegExpExecArray | null
+    while ((skillOpenMatch = skillOpenRe.exec(s)) !== null) {
+      if (skillOpenMatch.index < skillsIdx || skillOpenMatch.index >= skillsBlockRealEnd) continue
+      const skillStart = skillOpenMatch.index
+      const skillCloseIdx = s.indexOf("</skill>", skillStart)
+      if (skillCloseIdx < 0) continue
+      const skillBlock = s.slice(skillStart, skillCloseIdx + 8)
+      const nameMatch = skillBlock.match(/<name>([^<]+)<\/name>/)
+      const name = nameMatch ? nameMatch[1].trim() : "unknown"
+      const locMatch = skillBlock.match(/<location>([^<]+)<\/location>/)
+      const loc = locMatch ? locMatch[1].trim() : ""
+      const label = skillLabel(name, loc)
+      skillEntries.push({ label, start: skillStart })
+    }
+
+    if (skillEntries.length > 0) {
+      const preambleEnd = skillEntries[0].start
+      const preamble = s.slice(skillsIdx, preambleEnd).trim()
+      if (preamble) {
+        secs.push({ label: "Skills (header)", start: skillsIdx, end: preambleEnd })
+      }
+
+      for (let i = 0; i < skillEntries.length; i++) {
+        const skillCloseIdx = s.indexOf("</skill>", skillEntries[i].start)
+        const skillEntryEnd = skillCloseIdx >= 0 ? skillCloseIdx + 8 : (i + 1 < skillEntries.length ? skillEntries[i + 1].start : skillsBlockRealEnd)
+        secs.push({
+          label: skillEntries[i].label,
+          start: skillEntries[i].start,
+          end: skillEntryEnd,
+        })
+      }
+
+      const lastSkillEnd = secs[secs.length - 1].end
+      if (lastSkillEnd < skillsBlockRealEnd) {
+        const closing = s.slice(lastSkillEnd, skillsBlockRealEnd).trim()
+        if (closing) {
+          secs.push({ label: "Skills (closing)", start: lastSkillEnd, end: skillsBlockRealEnd })
+        }
+      }
+    } else {
+      secs.push({ label: "Skills", start: skillsIdx, end: skillsBlockRealEnd })
+    }
+  }
+
+  const structStart = s.indexOf("IMPORTANT: The user has requested structured output")
+  if (structStart >= 0) {
+    secs.push({ label: "Structured output", start: structStart, end: s.length })
+  }
+
+  secs.sort((a, b) => a.start - b.start)
+  for (let i = 1; i < secs.length; i++) {
+    if (secs[i].start < secs[i - 1].end) {
+      secs[i - 1].end = secs[i].start
+    }
+  }
+
+  const result: SourceBreakdown[] = []
+
+  if (secs.length > 0 && secs[0].start > 0) {
+    const base = s.slice(0, secs[0].start).trim()
+    if (base) {
+      result.push({ label: "Base prompt", chars: base.length, tokens: est(base.length) })
+    }
+  } else if (secs.length === 0) {
+    result.push({ label: "Base prompt", chars: trimmed.length, tokens: est(trimmed.length) })
+    return result
+  }
+
+  for (const sec of secs) {
+    const content = s.slice(sec.start, sec.end).trim()
+    if (content) {
+      result.push({ label: sec.label, chars: content.length, tokens: est(content.length) })
+    }
+  }
+
+  const measuredChars = result.reduce((sum, r) => sum + r.chars, 0)
+  const gapChars = trimmed.length - measuredChars
+  if (gapChars > 10) {
+    result.push({ label: "Whitespace", chars: gapChars, tokens: est(gapChars) })
+  }
+
+  return result
+}
+
+function nextMajorMarkerAfter(s: string, after: number): number {
+  const markers = [
+    "Skills provide specialized instructions",
+    "IMPORTANT: The user has requested structured output",
+  ]
   let nearest = s.length
-  for (const mk of markers) {
-    const idx = s.indexOf(mk, after + 1)
+  for (const m of markers) {
+    const idx = s.indexOf(m, after + 1)
     if (idx > after && idx < nearest) nearest = idx
   }
   return nearest
 }
 
-// ─── Fetch wrapper ───────────────────────────────────────────
-// Captures the FINAL HTTP body sent to the LLM. Single capture point.
-let _originalFetch: typeof fetch | null = null
-let _fetchWrapped = false
-function wrapFetch(): void {
-  if (_fetchWrapped) return
-  _fetchWrapped = true
-  _originalFetch = globalThis.fetch
-  globalThis.fetch = async function (input: RequestInfo | URL, init?: RequestInit): Promise<Response> {
-    const url = typeof input === "string" ? input : input instanceof URL ? input.href : (input as Request).url
-    const isLLM = url.includes("/v1/chat/completions") || url.includes("/v1/messages") ||
-      url.includes("api.deepseek.com") || url.includes("api.openai.com") ||
-      url.includes("anthropic.com") || url.includes("openrouter.ai")
-    if (!isLLM || !init?.body) return _originalFetch!.call(globalThis, input, init)
+// ─── Count chars in a part AUTOMATICALLY ──────────────────────────────────────
+// No hardcoded type checks — stringify whatever the part contains.
 
-    let bodyText = ""
-    try {
-      if (typeof init.body === "string") bodyText = init.body
-      else if (init.body instanceof Uint8Array || init.body instanceof ArrayBuffer) bodyText = new TextDecoder().decode(init.body)
-      else if (init.body instanceof Blob) bodyText = await init.body.text()
-      else if (init.body instanceof ReadableStream) return _originalFetch!.call(globalThis, input, init)
-    } catch { return _originalFetch!.call(globalThis, input, init) }
-
-    if (!bodyText) return _originalFetch!.call(globalThis, input, init)
-
-    try {
-      const body = JSON.parse(bodyText)
-      // Extract sessionID from headers
-      const h = init.headers
-      const headers = h instanceof Headers ? h : Array.isArray(h) ? new Headers(h as any) : h ? new Headers(h as any) : new Headers()
-      const sid = headers.get("x-opencode-session") || headers.get("x-session-id") || headers.get("X-Session-Id") || "__unknown__"
-
-      let systemText = ""
-      const messages: { role: string; text: string }[] = []
-      const tools: { name: string; rawJson: string }[] = []
-
-      if (Array.isArray(body.messages)) {
-        for (const msg of body.messages) {
-          const content = typeof msg.content === "string" ? msg.content : JSON.stringify(msg.content || "")
-          if (msg.role === "system") {
-            systemText += (systemText ? "\n" : "") + content
-          } else {
-            messages.push({ role: msg.role, text: content })
-          }
-        }
-      }
-      if (Array.isArray(body.tools)) {
-        for (const tool of body.tools) {
-          const rawJson = JSON.stringify(tool)
-          const name = tool.function?.name || tool.name || "unknown"
-          tools.push({ name, rawJson })
-        }
-      }
-
-      const payload: InterceptedPayload = {
-        url, model: body.model || "unknown", sessionID: sid,
-        systemText, messages, tools, rawBodyLength: bodyText.length,
-      }
-      payloadBySession.set(sid, payload)
-    } catch {
-      // Body wasn't valid JSON — skip
-    }
-    return _originalFetch!.call(globalThis, input, init)
+function partChars(p: any): number {
+  if (!p) return 0
+  // text parts: count the text directly
+  if (typeof p.text === "string" && p.text.length > 0) return p.text.length
+  // everything else: JSON.stringify the whole object
+  try {
+    return JSON.stringify(p).length
+  } catch {
+    return 0
   }
 }
 
-// ─── Plugin ──────────────────────────────────────────────────
-const TokensSourcePlugin: Plugin = async (input: PluginInput): Promise<Hooks> => {
-  const { client, directory: projectDir } = input
-  wrapFetch()
-  return {
-    // Capture system parts (array, before joining)
-    "experimental.chat.system.transform": async (transformInput: any, output: any) => {
-      const sid = transformInput.sessionID || "__global__"
-      const parts = (output.system as string[]).filter(Boolean)
-      if (parts.length) systemPartsBySession.set(sid, parts)
-    },
+function partTypeLabel(p: any): string {
+  if (!p) return "?"
+  if (p.type === "text" || (typeof p.text === "string" && (!p.type || p.type === "text"))) return "text"
+  if (p.type === "tool-invocation") {
+    const toolName = p.toolInvocation?.toolName || p.toolInvocation?.name || ""
+    return "tool-call:" + toolName
+  }
+  if (p.type === "tool-result") {
+    const toolName = p.toolName || p.toolInvocation?.toolName || ""
+    return "tool-result:" + toolName
+  }
+  // Any other type — just use the type field
+  return p.type || "unknown"
+}
 
-    // Capture known agents at startup (NO LLM call)
-    "config": async (cfg: any) => {
-      knownAgents.clear()
-      const agents = cfg?.agent
-      if (!agents || typeof agents !== "object") return
-      for (const [name, info] of Object.entries(agents)) {
-        const a = info as any
-        if (!a || typeof a.prompt !== "string" || !a.prompt.trim()) continue
-        let path = `.config/opencode/agents/${name}.md`
-        for (const candidate of [`${projectDir}/.opencode/agents/${name}.md`, `${projectDir}/.opencode/agent/${name}.md`]) {
-          try { if (await Bun.file(candidate).exists()) { path = `.opencode/agents/${name}.md`; break } } catch {}
+
+// ─── Fetch wrapper — captures REAL tools sent to the LLM ─────────────────────
+//
+// This plugin loads BEFORE opencode-lazy-load (filename `0-tokens-source.ts`
+// sorts before `opencode-lazy-load.ts` alphabetically). This makes tokens-source
+// the INNER fetch wrapper, and lazy-load the OUTER wrapper.
+//
+// When the LLM is called:
+//   1. lazy-load's wrapper (outer) runs first — strips all tools except load_tool,
+//      appends pointer list to load_tool's description
+//   2. lazy-load calls _originalFetch → tokens-source's wrapper (inner) runs
+//   3. tokens-source sees the FINAL body (just load_tool with pointers) and
+//      captures it
+//   4. tokens-source calls _originalFetch → real fetch
+//
+// This gives accurate per-tool token counts that reflect what the LLM ACTUALLY
+// sees, not what's registered.
+
+const realToolDefs = new Map<string, { description: string; schema: any }>()
+
+let _tsOriginalFetch: typeof fetch | null = null
+let _tsFetchWrapped = false
+
+function wrapFetchForTools(): void {
+  if (_tsFetchWrapped) return
+  _tsFetchWrapped = true
+  _tsOriginalFetch = globalThis.fetch
+
+  globalThis.fetch = async function (input: RequestInfo | URL, init?: RequestInit): Promise<Response> {
+    const url = typeof input === "string"
+      ? input
+      : input instanceof URL ? input.href : (input as Request).url
+
+    // ONLY intercept LLM API calls. Everything else passes through unchanged.
+    const isLLM = url.includes("/chat/completions") || url.includes("/v1/messages") ||
+      url.includes("api.deepseek.com") || url.includes("api.openai.com") ||
+      url.includes("anthropic.com") || url.includes("openrouter.ai") ||
+      url.includes("opencode.ai/zen")
+
+    if (!isLLM || !init || !init.body) {
+      return _tsOriginalFetch!.call(globalThis, input, init)
+    }
+
+    // Read body — read-only, do NOT modify
+    let bodyText = ""
+    if (typeof init.body === "string") bodyText = init.body
+    else if (init.body instanceof Uint8Array || init.body instanceof ArrayBuffer) {
+      bodyText = new TextDecoder().decode(init.body)
+    } else if (init.body instanceof Blob) {
+      bodyText = await init.body.text()
+    }
+
+    if (bodyText) {
+      try {
+        const body = JSON.parse(bodyText)
+        if (Array.isArray(body.tools)) {
+          // Clear previous captures — each LLM call may have different tools
+          // (e.g. lazy-load strips to just load_tool)
+          realToolDefs.clear()
+          for (const t of body.tools) {
+            const fn = t?.function
+            const name = fn?.name || t?.name || ""
+            if (!name) continue
+            const desc = fn?.description || t?.description || ""
+            const params = fn?.parameters || t?.parameters
+            realToolDefs.set(name, { description: desc, schema: params })
+          }
         }
-        knownAgents.set(name, { name, prompt: a.prompt.trim(), path })
+      } catch {
+        // Body wasn't valid JSON — pass through
       }
+    }
+
+    // Pass through UNCHANGED — do not modify init or body
+    return _tsOriginalFetch!.call(globalThis, input, init)
+  }
+}
+
+
+// ─── Plugin ──────────────────────────────────────────────────────────────────
+
+const TokensSourcePlugin: Plugin = async (input: PluginInput): Promise<Hooks> => {
+  const { client } = input
+
+  // Wrap fetch FIRST (before lazy-load wraps it). This makes tokens-source
+  // the INNER wrapper, so it sees the body AFTER lazy-load strips tools.
+  wrapFetchForTools()
+
+  return {
+    // Capture system prompt breakdown
+    "experimental.chat.system.transform": async (transformInput, output) => {
+      const sessionID = (transformInput as any).sessionID as string | undefined
+      const rawParts  = output.system.filter(Boolean)
+      if (!rawParts.length) return
+
+      const sid = sessionID || "__global__"
+
+      const sources           = parseSystemArray(rawParts)
+      const totalSystemChars  = rawParts.join("\n").length
+      const totalSystemTokens = est(totalSystemChars)
+
+      snapshots.set(sid, {
+        sources,
+        totalSystemChars,
+        totalSystemTokens,
+        timestamp: Date.now(),
+      })
     },
 
-    // Track tool execution (for OTHER section)
-    "tool.execute.before": async (toolInput: any, toolOutput: any) => {
-      const tool = toolInput.tool as string | undefined
-      const callID = toolInput.callID as string | undefined
-      if (!tool || !callID) return
-      const args = toolOutput.args || {}
-      const file = args.file_path || args.path || undefined
-      pendingCalls.set(callID, { tool, file, args: { ...args } })
-      if (file && isInstructionFile(file)) {
-        const ex = fileReads.get(file) || { chars: 0, tokens: 0, reads: 0, isInstruction: false }
-        ex.isInstruction = true
-        fileReads.set(file, ex)
+    // Capture FINAL messages after ALL transforms — this is exactly what gets sent to the LLM
+    "experimental.chat.messages.transform": async (_input, output) => {
+      const msgs = output.messages
+      if (!msgs || !msgs.length) return
+
+      const breakdowns: MsgBreakdown[] = []
+      let totalChars = 0
+
+      for (const msg of msgs) {
+        const role = msg.info?.role || "unknown"
+        const parts: MsgBreakdown["parts"] = []
+        let msgChars = 0
+
+        for (const part of msg.parts) {
+          const p = part as any
+          const chars = partChars(p)
+          const type = partTypeLabel(p)
+          parts.push({ type, chars, tokens: est(chars) })
+          msgChars += chars
+        }
+
+        totalChars += msgChars
+        breakdowns.push({
+          role,
+          parts,
+          totalChars: msgChars,
+          totalTokens: est(msgChars),
+        })
       }
+
+      // Store per-session — use last part of the session key
+      // The messages transform doesn't receive sessionID directly,
+      // so we store it as the latest snapshot (there's typically one active session)
+      const sid = "__latest__"
+
+      msgSnapshots.set(sid, {
+        messages: breakdowns,
+        totalChars,
+        totalTokens: est(totalChars),
+        timestamp: Date.now(),
+      })
     },
-    "tool.execute.after": async (toolInput: any, toolOutput: any) => {
-      const tool = toolInput.tool as string | undefined
-      const callID = toolInput.callID as string | undefined
-      if (!tool || !callID) return
-      const meta = pendingCalls.get(callID)
-      pendingCalls.delete(callID)
-      const output = String(toolOutput.output || toolOutput.title || "")
-      const tokens = estimateTokens(output)
-      if (tool === "read" && meta?.file) {
-        const ex = fileReads.get(meta.file) || { chars: 0, tokens: 0, reads: 0, isInstruction: false }
-        ex.chars += output.length
-        ex.tokens += tokens
-        ex.reads++
-        if (isInstructionFile(meta.file)) ex.isInstruction = true
-        fileReads.set(meta.file, ex)
+
+    // Capture tool IDs so we know which tools exist.
+    // NOTE: We do NOT use output.parameters here — it's an Effect Schema AST,
+    // not a JSON Schema. Stringifying it gives ~6x inflated token counts.
+    // The real JSON Schema is captured by the fetch wrapper in realToolDefs.
+    // The /tokens command uses realToolDefs when available; this hook only
+    // registers the tool ID so we know it exists even before the first LLM call.
+    "tool.definition": async (toolInput, toolOutput) => {
+      const outAny = toolOutput as any
+      const desc = outAny?.description || ""
+      const effectParams = outAny?.parameters
+
+      // Convert Effect Schema to real JSON Schema for accurate token estimation
+      const jsonSchema = effectToJSONSchema(effectParams)
+      const jsonLen = jsonSchema ? JSON.stringify(jsonSchema).length : 0
+
+      const existing = globalTools.find((t) => t.id === toolInput.toolID)
+      if (existing) {
+        existing.tokens = est(desc.length + jsonLen)
       } else {
-        const ex = toolOutputs.get(tool) || { chars: 0, tokens: 0, count: 0 }
-        ex.chars += output.length
-        ex.tokens += tokens
-        ex.count++
-        toolOutputs.set(tool, ex)
+        globalTools.push({
+          id: toolInput.toolID,
+          tokens: est(desc.length + jsonLen),
+        })
       }
     },
 
     // /tokens command
-    "command.execute.before": async (cmdInput: any, cmdOutput: any) => {
+    "command.execute.before": async (cmdInput, cmdOutput) => {
       if (cmdInput.command !== "tokens") return
-      // Clear the command's default output parts (from .opencode/commands/tokens.md)
-      // so only the plugin's output shows — not the command file's content.
-      if (cmdOutput && Array.isArray(cmdOutput.parts)) cmdOutput.parts.length = 0
-      const debugEnabled = (cmdInput.arguments || "").trim() === "--debug"
+
       const sessionID = cmdInput.sessionID
-      const sid = sessionID || "__global__"
+      const sid       = sessionID || "__global__"
+      const snapshot  = snapshots.get(sid)
+      const msgSnap   = msgSnapshots.get("__latest__")
 
-      // ── Gather data ──
-      const systemParts = systemPartsBySession.get(sid)
-      const payload = payloadBySession.get(sid) || null
+      // Fetch exact token data from API
+      let lastInput = 0, lastOutput = 0, lastReasoning = 0
+      let lastCacheRead = 0, lastCacheWrite = 0
+      let totalInput = 0, totalOutput = 0, totalReasoning = 0
+      let llmTurns = 0
 
-      // Parse system text into sections
-      const systemText = systemParts ? systemParts.join("\n") : (payload?.systemText || "")
-      let sources = parseSystem(systemText)
-
-      // Agent attribution: match known agent prompt as prefix of systemText
-      const agentItems: SourceItem[] = []
-      if (systemText && knownAgents.size > 0) {
-        for (const [name, agent] of knownAgents) {
-          if (agent.prompt && systemText.startsWith(agent.prompt)) {
-            const agentTokens = estimateTokens(agent.prompt)
-            agentItems.push({ label: agent.path, tokens: agentTokens, chars: agent.prompt.length, category: "rules" })
-            // Subtract from base prompt item
-            const baseIdx = sources.findIndex(s => s.category === "base")
-            if (baseIdx >= 0) {
-              const base = sources[baseIdx]
-              const restChars = Math.max(0, base.chars - agent.prompt.length)
-              if (restChars > 0) {
-                sources[baseIdx] = { ...base, tokens: Math.max(0, base.tokens - agentTokens), chars: restChars }
-              } else {
-                sources.splice(baseIdx, 1)
-              }
-            }
-            break
+      try {
+        const msgResult = await client.session.messages({
+          path: { id: sessionID },
+          query: { limit: 200 },
+        })
+        const messages = msgResult.data ?? []
+        for (const msg of messages) {
+          if (msg.info.role === "assistant" && msg.info.tokens) {
+            const t = msg.info.tokens
+            const cacheRead = t.cache?.read ?? 0
+            const fullInput = t.input + cacheRead
+            totalInput    += fullInput;   lastInput     = fullInput
+            totalOutput   += t.output;     lastOutput    = t.output
+            totalReasoning += t.reasoning; lastReasoning = t.reasoning
+            lastCacheRead  = t.cache?.read  ?? 0
+            lastCacheWrite = t.cache?.write ?? 0
+            llmTurns++
           }
         }
-      }
+      } catch { /* show what we have */ }
 
-      // Group by category
-      const baseItems = sources.filter(s => s.category === "base")
-      const envItems = sources.filter(s => s.category === "env")
-      const rulesItems = sources.filter(s => s.category === "rules").concat(agentItems)
-      const builtinItems = sources.filter(s => s.category === "builtin-skill")
-      const skillItems = sources.filter(s => s.category === "skill")
-      const toolItems: SourceItem[] = payload ? payload.tools.map(t => ({
-        label: t.name, tokens: estimateTokens(t.rawJson), chars: t.rawJson.length, category: "tools",
-      })) : []
-      const msgItems: SourceItem[] = payload ? payload.messages.map(m => ({
-        label: m.role, tokens: estimateTokens(m.text), chars: m.text.length, category: "messages",
-      })) : []
-      // File reads + tool outputs → other
-      const otherItems: SourceItem[] = []
-      for (const [file, data] of fileReads) {
-        const base = cleanPath(file)
-        otherItems.push({
-          label: (data.isInstruction ? base + " [AGENTS]" : base) + " x" + data.reads,
-          tokens: data.tokens, chars: data.chars, category: "other",
-        })
-      }
-      for (const [tool, data] of toolOutputs) {
-        otherItems.push({
-          label: tool + " (" + data.count + ")" + (isMCPTool(tool) ? " [MCP]" : ""),
-          tokens: data.tokens, chars: data.chars, category: "other",
-        })
-      }
-
-      // ── Build output lines ──
-      // Compute GLOBAL column widths across ALL sections (unified layout).
-      const allItems = baseItems.concat(envItems, rulesItems, builtinItems, skillItems, toolItems, msgItems, otherItems)
-      const allLabels = allItems.map(i => "  " + i.label)
-      const allVals = allItems.map(i => i.tokens.toLocaleString())
-      const W_LABEL = Math.max(...allLabels.map(l => l.length), "TOTAL".length)
-      const W_VALUE = Math.max(...allVals.map(v => v.length), "0".length)
-      const W_GAP = 2
-
+      // ── Build output ──────────────────────────────────────────────────
       const lines: string[] = []
-      lines.push("TOKEN SOURCE TRACKING")
-      lines.push("-".repeat(W_LABEL + W_GAP + W_VALUE))
-      if (payload) {
-        lines.push("model: " + payload.model)
-        lines.push("url: " + payload.url)
-      }
-      lines.push("")
+      const HR = "-".repeat(50)
+      const maxLabel = Math.max(
+        ...(snapshot?.sources.map(s => s.label.length) || [20]),
+        ...(globalTools.map(t => t.id.length) || [8]),
+        20
+      )
+      const colW = Math.min(maxLabel, 45)
 
-      // Helper: render a section using GLOBAL column widths
-      // showTotal: only SKILLS and TOOLS get a TOTAL line
-      function renderSection(title: string, items: SourceItem[], showTotal: boolean) {
-        if (items.length === 0) return
-        lines.push(title)
-        for (const item of items) {
-          const lbl = "  " + item.label
-          const val = item.tokens.toLocaleString()
-          lines.push(lbl.padEnd(W_LABEL) + " ".repeat(W_GAP) + val.padStart(W_VALUE))
+      function row(label: string, tokens: number): string {
+        const lbl = label.length > colW ? ".." + label.slice(-(colW - 2)) : label
+        return "  " + lbl.padEnd(colW + 2) + "~" + tokens.toLocaleString()
+      }
+
+      // ── System Prompt ─────────────────────────────────────────────────
+      if (snapshot && snapshot.sources.length > 0) {
+        lines.push("System Prompt")
+        lines.push(HR)
+        for (const src of snapshot.sources) {
+          lines.push(row(src.label, src.tokens))
         }
-        if (showTotal) {
-          const total = items.reduce((s, x) => s + x.tokens, 0)
-          lines.push(bold("TOTAL".padEnd(W_LABEL) + " ".repeat(W_GAP) + total.toLocaleString().padStart(W_VALUE)))
-        }
+        lines.push(HR)
+        lines.push(row("total", snapshot.totalSystemTokens))
+        lines.push("")
+      } else {
+        lines.push("System prompt: send a message first")
         lines.push("")
       }
 
-      renderSection("BASE PROMPT", baseItems, false)
-      renderSection("ENVIRONMENT", envItems, false)
-      renderSection("PROJECT RULES", rulesItems, false)
-      renderSection("BUILT-IN SKILLS", builtinItems, false)
-      renderSection("SKILLS", skillItems, true)
-      renderSection("TOOLS", toolItems, true)
-      renderSection("MESSAGES", msgItems, false)
-      renderSection("OTHER", otherItems.sort((a, b) => b.tokens - a.tokens), false)
-
-      // Grand total — NOT displayed. Only used internally if needed.
-      // (kept for potential future use but not shown in output)
-      const _grandTotal = baseItems.concat(envItems, rulesItems, builtinItems, skillItems, toolItems, msgItems, otherItems)
-        .reduce((s, x) => s + x.tokens, 0)
-      lines.push("========================================")
-      lines.push("for debugging run /tokens --debug")
-
-      // ── Debug section ──
-      if (debugEnabled) {
-        lines.push("")
-        lines.push("DEBUG RAW DATA")
-        lines.push("-".repeat(60))
-        lines.push("session_id: " + sid)
-        lines.push("systemParts_count: " + (systemParts?.length ?? 0))
-        lines.push("systemText_chars: " + systemText.length)
-        lines.push("systemText_tokens: " + estimateTokens(systemText))
-        lines.push("payload_exists: " + (!!payload))
-        if (payload) {
-          lines.push("payload_url: " + payload.url)
-          lines.push("payload_model: " + payload.model)
-          lines.push("payload_sessionID: " + payload.sessionID)
-          lines.push("payload_systemText_chars: " + payload.systemText.length)
-          lines.push("payload_messages_count: " + payload.messages.length)
-          lines.push("payload_messages_chars: " + payload.messages.reduce((s, m) => s + m.text.length, 0))
-          lines.push("payload_tools_count: " + payload.tools.length)
-          lines.push("payload_tools_chars: " + payload.tools.reduce((s, t) => s + t.rawJson.length, 0))
-          lines.push("payload_rawBody_chars: " + payload.rawBodyLength)
-          for (let i = 0; i < payload.messages.length; i++) {
-            const m = payload.messages[i]
-            lines.push("  msg[" + i + "]: role=" + m.role + " chars=" + m.text.length + " tokens=" + estimateTokens(m.text) + " first50=" + JSON.stringify(m.text.slice(0, 50)))
-          }
-          for (let i = 0; i < payload.tools.length; i++) {
-            const t = payload.tools[i]
-            lines.push("  tool[" + i + "]: name=" + t.name + " chars=" + t.rawJson.length + " tokens=" + estimateTokens(t.rawJson))
-          }
+      // ── Tools ─────────────────────────────────────────────────────────
+      // PREFER realToolDefs (captured from fetch body — what the LLM ACTUALLY sees).
+      // This reflects any tool stripping by other plugins (e.g. opencode-lazy-load
+      // strips all tools except load_tool, so realToolDefs will only contain load_tool
+      // with the pointer-augmented description).
+      //
+      // FALL BACK to globalTools (from tool.definition hook) if no LLM call has
+      // happened yet — this shows all REGISTERED tools with Effect-converted schemas.
+      const toolEntries: ToolBreakdown[] = []
+      if (realToolDefs.size > 0) {
+        for (const [name, def] of realToolDefs) {
+          const descLen = (def.description || "").length
+          const schemaLen = def.schema ? JSON.stringify(def.schema).length : 0
+          toolEntries.push({ id: name, tokens: est(descLen + schemaLen) })
         }
-        lines.push("knownAgents_count: " + knownAgents.size)
-        for (const [name, agent] of knownAgents) {
-          lines.push("  agent: name=" + name + " prompt_chars=" + agent.prompt.length + " prompt_tokens=" + estimateTokens(agent.prompt) + " path=" + agent.path)
+      } else {
+        for (const t of globalTools) {
+          toolEntries.push({ id: t.id, tokens: t.tokens })
         }
-        lines.push("fileReads_count: " + fileReads.size)
-        lines.push("toolOutputs_count: " + toolOutputs.size)
-        lines.push("grandTotal: " + _grandTotal)
-        lines.push("-".repeat(60))
       }
 
-      // ── Send output ──
+      if (toolEntries.length > 0) {
+        const totalToolTokens = toolEntries.reduce((s, t) => s + t.tokens, 0)
+        const sourceLabel = realToolDefs.size > 0 ? " (from API body)" : " (registered)"
+        lines.push("Tools" + sourceLabel)
+        lines.push(HR)
+        const sorted = [...toolEntries].sort((a, b) => b.tokens - a.tokens)
+        for (const tool of sorted) {
+          lines.push(row(tool.id, tool.tokens))
+        }
+        lines.push(HR)
+        lines.push(row("total (" + sorted.length + ")", totalToolTokens))
+        lines.push("")
+      }
+
+      // ── Messages (from experimental.chat.messages.transform) ──────────
+      if (msgSnap && msgSnap.messages.length > 0) {
+        lines.push("Messages (" + msgSnap.messages.length + ")")
+        lines.push(HR)
+
+        // Group by role for summary
+        const byRole = new Map<string, { chars: number; tokens: number; count: number }>()
+        const byPartType = new Map<string, { chars: number; tokens: number; count: number }>()
+
+        for (const msg of msgSnap.messages) {
+          const existing = byRole.get(msg.role) || { chars: 0, tokens: 0, count: 0 }
+          existing.chars += msg.totalChars
+          existing.tokens += msg.totalTokens
+          existing.count++
+          byRole.set(msg.role, existing)
+
+          for (const part of msg.parts) {
+            const pe = byPartType.get(part.type) || { chars: 0, tokens: 0, count: 0 }
+            pe.chars += part.chars
+            pe.tokens += part.tokens
+            pe.count++
+            byPartType.set(part.type, pe)
+          }
+        }
+
+        // Show per-role breakdown
+        for (const [role, data] of byRole) {
+          lines.push(row(role + " (" + data.count + ")", data.tokens))
+        }
+        lines.push("")
+
+        // Show per-part-type breakdown
+        lines.push("  Message part types:")
+        const sortedParts = [...byPartType.entries()].sort((a, b) => b[1].tokens - a[1].tokens)
+        for (const [type, data] of sortedParts) {
+          lines.push(row("  " + type + " (" + data.count + ")", data.tokens))
+        }
+
+        lines.push(HR)
+        lines.push(row("total", msgSnap.totalTokens))
+        lines.push("")
+      }
+
+      // ── Estimated total ───────────────────────────────────────────────
+      const sysTokens = snapshot?.totalSystemTokens ?? 0
+      const toolTokens = toolEntries.reduce((s, t) => s + t.tokens, 0)
+      const msgTokens = msgSnap?.totalTokens ?? 0
+      const estimatedTotal = sysTokens + toolTokens + msgTokens
+
+      lines.push("Estimated Total")
+      lines.push(HR)
+      lines.push(row("system", sysTokens))
+      lines.push(row("tools", toolTokens))
+      lines.push(row("messages", msgTokens))
+      lines.push(HR)
+      lines.push(row("ESTIMATED", estimatedTotal))
+
+      // ── API actual ────────────────────────────────────────────────────
+      if (lastInput > 0) {
+        lines.push("")
+        lines.push("API Actual (last call)")
+        lines.push(HR)
+        lines.push("  in:" + lastInput + " (fresh:" + (lastInput - lastCacheRead) + " cache_r:" + lastCacheRead + ")" +
+          " out:" + lastOutput + " reason:" + lastReasoning +
+          (lastCacheWrite > 0 ? " cache_w:" + lastCacheWrite : ""))
+
+        const diff = lastInput - estimatedTotal
+        if (diff !== 0) {
+          lines.push("  estimated:" + estimatedTotal + " actual:" + lastInput + " diff:" + diff)
+        }
+
+        lines.push("")
+        lines.push("Session  in:" + totalInput + " out:" + totalOutput + " reason:" + totalReasoning + " turns:" + llmTurns)
+      }
+
+      // ── Deliver — NO throw, NO LLM call ──────────────────────────────
       const text = lines.join("\n")
+
       try {
         await client.session.prompt({
           path: { id: sessionID },
-          body: { noReply: true, parts: [{ type: "text", text }] },
+          body: {
+            noReply: true,
+            parts: [{ type: "text", text }],
+          },
         })
-      } catch {}
+      } catch { /* ignore */ }
+
       Promise.resolve().then(async () => {
-        try { await client.session.abort({ path: { id: sessionID } }) } catch {}
+        try {
+          await client.session.abort({ path: { id: sessionID } })
+        } catch { /* acceptable */ }
       })
+
+      cmdOutput.parts.length = 0
     },
   }
 }
-export default TokensSourcePlugin
 
+export default {
+  id: "tokens-source",
+  server: TokensSourcePlugin,
+}
