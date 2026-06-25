@@ -59,7 +59,7 @@ See what's consuming your context window — broken down by source.
 
 ### Prerequisites
 
-- [opencode](https://opencode.ai) v1.14 or later
+- [opencode](https://opencode.ai) v1.17.10 or later
 - An existing opencode project (a directory with a `.opencode/` folder)
 
 ### Quick Install (Git Clone)
@@ -170,7 +170,7 @@ Per-section token counts are **estimates** based on character count, not exact t
 
 **Why?** Tokenizers are model-specific (GPT, Claude, DeepSeek each use different BPE vocabularies). Bundling one adds 2–4 MB of dependencies. The plugin's goal is **source attribution** — showing which content consumed tokens — not billing accuracy.
 
-**Expected variance:** The grand total may differ from your provider's reported input tokens by **5–12%**, depending on content type:
+**Expected variance:** The grand total may differ from your provider's reported input tokens by **1–5%**, depending on content type:
 - JSON-heavy content (tool definitions) tends to over-estimate
 - Plain English prose is closer to actual
 - Per-section **relative proportions** are reliable even when absolute numbers differ
